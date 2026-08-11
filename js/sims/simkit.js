@@ -1,0 +1,178 @@
+// عدة المحاكاة: canvas بدقة الشاشة + حلقة رسم + تحكمات لمس جاهزة
+import { el } from '../ui.js';
+import { on } from '../store.js';
+
+// لوحة ألوان حيّة من متغيرات CSS — تدعم الوضعين فاتح/داكن
+// عقد المحاكيات: الألوان من kit.pal حصرًا — ممنوع hex صلب داخل ملفات المحاكاة
+export function readPalette() {
+  const cs = getComputedStyle(document.documentElement);
+  const v = (n, fb) => (cs.getPropertyValue(n) || fb).trim() || fb;
+  return {
+    bg:     v('--c-simbg',  '#0a1526'),
+    text:   v('--c-text',   '#e2e8f0'),
+    text2:  v('--c-text2',  '#94a3b8'),
+    // ماء المحاكيات مفصول عن لون الواجهة الرئيسي: منصات بهوية غير زرقاء تُبقي الماء أزرق
+    water:  v('--c-simwater',  v('--c-water',  '#38bdf8')),
+    water2: v('--c-simwater2', v('--c-water2', '#22d3ee')),
+    amber:  v('--c-amber',  '#fbbf24'),
+    ok:     v('--c-ok',     '#34d399'),
+    bad:    v('--c-bad',    '#f87171'),
+    badge:  v('--c-badge',  '#a78bfa'),
+    line:   v('--c-border2','rgba(255,255,255,.16)'),
+  };
+}
+
+// hex → rgba بشفافية (لتدرجات الموائع في الوضعين)
+export function withAlpha(hex, a) {
+  const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex.trim());
+  if (!m) return hex; // rgba() جاهزة تمر كما هي
+  return `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},${a})`;
+}
+
+// لوحة الوحدة الحالية على مستوى الوحدة النمطية — label() تعتمد عليها افتراضيًا
+let PAL = null;
+function pal() { return PAL ||= readPalette(); }
+on('theme', () => { PAL = readPalette(); });
+
+export class SimKit {
+  // container: عنصر .sim-wrap — ratio: نسبة ارتفاع/عرض اللوحة
+  constructor(container, { ratio = 0.62 } = {}) {
+    this.container = container;
+    this.stage = el('div', { class: 'sim-stage' });
+    this.canvas = document.createElement('canvas');
+    this.stage.append(this.canvas);
+    this.controls = el('div', { class: 'sim-controls' });
+    container.append(this.stage, this.controls);
+    this.ctx = this.canvas.getContext('2d');
+    this.ratio = ratio;
+    this._raf = 0;
+    this._running = false;
+    this._drawFn = null;
+    this._resize = this._resize.bind(this);
+    window.addEventListener('resize', this._resize);
+    this._resize();
+    // إيقاف الرسم عند الخروج من الشاشة (توفير بطارية)
+    this._io = new IntersectionObserver(entries => {
+      // آخر إدخال هو الأحدث — أخذ الأول قد يعلّق الحلقة على حالة قديمة
+      this._visible = entries[entries.length - 1]?.isIntersecting ?? true;
+    });
+    this._io.observe(this.stage);
+    this._visible = true;
+    // لوحة الألوان الحية: تُقرأ الآن وتتجدد مع تبديل الثيم
+    this.pal = readPalette();
+    this._offTheme = on('theme', () => { this.pal = readPalette(); PAL = this.pal; });
+  }
+
+  _resize() {
+    const w = this.stage.clientWidth || 340;
+    const h = Math.round(w * this.ratio);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.canvas.width = Math.round(w * dpr);
+    this.canvas.height = Math.round(h * dpr);
+    this.canvas.style.height = h + 'px';
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.W = w; this.H = h;
+  }
+
+  // fn(ctx, dt, t) — تُستدعى كل إطار
+  loop(fn) {
+    this._drawFn = fn;
+    this._running = true;
+    let last = performance.now();
+    const tick = (now) => {
+      if (!this._running) return;
+      this._raf = requestAnimationFrame(tick);
+      if (!this._visible) return;
+      const dt = Math.min((now - last) / 1000, 0.05);
+      last = now;
+      this._t = (this._t || 0) + dt;
+      this.ctx.clearRect(0, 0, this.W, this.H);
+      this._drawFn(this.ctx, dt, this._t);
+    };
+    this._raf = requestAnimationFrame(tick);
+  }
+
+  // منزلق تحكم — يرجع {get value}
+  slider({ label, min, max, step = 1, value, unit = '', fmt: fmtFn, oninput }) {
+    const out = el('output');
+    const input = el('input', { type: 'range', min, max, step, value });
+    const show = v => { out.textContent = (fmtFn ? fmtFn(v) : v) + (unit ? ' ' + unit : ''); };
+    input.addEventListener('input', () => { show(+input.value); oninput?.(+input.value); });
+    show(value);
+    this.controls.append(el('div', { class: 'sim-row' }, el('label', {}, label), input, out));
+    // set() يحاكي سحب المستخدم: يُحدّث العرض ويُبلّغ oninput كي لا تنفصل حالة المحاكاة
+    return { get value() { return +input.value; }, set(v) { input.value = v; show(+v); oninput?.(+v); }, input };
+  }
+
+  // أزرار
+  buttons(defs) {
+    const row = el('div', { class: 'sim-btns' });
+    const btns = defs.map(d => {
+      const b = el('button', { class: `btn sm ${d.cls || 'secondary'}`, onclick: d.onclick }, d.label);
+      row.append(b);
+      return b;
+    });
+    this.controls.append(row);
+    return btns;
+  }
+
+  // شريط معلومات حي أسفل اللوحة
+  readout() {
+    const r = el('div', { class: 'sim-row', style: 'flex-wrap:wrap; gap:6px' });
+    this.controls.prepend(r);
+    let last = '';
+    return {
+      set(items) { // [{label, value, color}] — لا كتابة DOM إن لم تتغير القيم
+        const html = items.map(i =>
+          `<span class="chip" style="${i.color ? 'color:' + i.color : ''}">${i.label}: <b style="direction:ltr; unicode-bidi:isolate">${i.value}</b></span>`
+        ).join('');
+        if (html === last) return;
+        last = html;
+        r.innerHTML = html;
+      }
+    };
+  }
+
+  destroy() {
+    this._running = false;
+    cancelAnimationFrame(this._raf);
+    window.removeEventListener('resize', this._resize);
+    this._io.disconnect();
+    this._offTheme?.();
+    this.container.innerHTML = '';
+  }
+}
+
+// نص عربي على اللوحة (المحاذاة يمين افتراضيًا؛ اللون الافتراضي من اللوحة الحية)
+export function label(ctx, text, x, y, { size = 13, color = pal().text2, align = 'right', weight = 700 } = {}) {
+  ctx.save();
+  ctx.font = `${weight} ${size}px Cairo, sans-serif`;
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, x, y);
+  ctx.restore();
+}
+
+// سهم بسيط
+export function arrow(ctx, x1, y1, x2, y2, { color = pal().amber, width = 2.5, head = 7 } = {}) {
+  const a = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save();
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = width; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - head * Math.cos(a - 0.45), y2 - head * Math.sin(a - 0.45));
+  ctx.lineTo(x2 - head * Math.cos(a + 0.45), y2 - head * Math.sin(a + 0.45));
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+// تدرج ماء جاهز (ألوانه من اللوحة الحية — يعمل بالوضعين)
+export function waterGrad(ctx, y0, y1, alphaTop = 0.75, alphaBottom = 0.95) {
+  const p = pal();
+  const g = ctx.createLinearGradient(0, y0, 0, y1);
+  g.addColorStop(0, withAlpha(p.water, alphaTop));
+  g.addColorStop(1, withAlpha(p.water2, alphaBottom));
+  return g;
+}
